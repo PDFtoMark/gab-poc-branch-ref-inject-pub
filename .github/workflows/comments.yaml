@@ -1,0 +1,100 @@
+name: PR Comment Listener
+
+on:
+  issue_comment:
+    types: [created]
+
+defaults:
+  run:
+    shell: bash
+
+permissions:
+  actions: write
+  id-token: write
+  pull-requests: read
+
+jobs:
+  check-comment:
+    name: Parse action from comment
+    if: github.event.issue.pull_request && github.actor != 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check comment
+        id: action
+        env:
+          BODY: ${{ github.event.comment.body }}
+        run: |
+          case "${BODY,,}" in
+          "/test development")
+            echo "action=test" >> "$GITHUB_OUTPUT"
+            echo "env=Development" >> "$GITHUB_OUTPUT"
+          ;;
+          "/test staging")
+            echo "action=test" >> "$GITHUB_OUTPUT"
+            echo "env=Staging" >> "$GITHUB_OUTPUT"
+          ;;
+          "/test production")
+            echo "action=test" >> "$GITHUB_OUTPUT"
+            echo "env=Production" >> "$GITHUB_OUTPUT"
+          ;;
+          *)
+            echo "Nothing to do."
+          ;;
+          esac
+
+      # PoC substitution: the real workflow mints a GitHub App installation
+      # token from secrets.WORKFLOW_AUTH_PUBLIC_APP_ID / _PRIVATE_KEY.
+      - name: Generate Token
+        if: ${{ steps.action.outputs.action != '' }}
+        id: generate-token
+        run: |
+          echo "token=${{ secrets.GITHUB_TOKEN }}" >> "$GITHUB_OUTPUT"
+
+      # PoC substitution: the real workflow checks that the commenter is a
+      # member of the ClickHouse org via
+      #   curl ... https://api.github.com/orgs/$ORG_NAME/members/$USERNAME
+      # and requires a 204. In this PoC the gate is a static allow so that the
+      # injection primitive can be exercised by a single actor.
+      - name: Check Organization Membership
+        if: ${{ steps.action.outputs.action != '' }}
+        id: check-membership
+        run: |
+          echo "ok=true" >> "$GITHUB_OUTPUT"
+
+      - name: React to comment
+        if: ${{ steps.action.outputs.action != '' }}
+        env:
+          GH_TOKEN: ${{ steps.generate-token.outputs.token }}
+        run: |
+          content=""
+          if [ "${{ steps.check-membership.outputs.ok }}" == "true" ]
+          then
+            content="+1"
+          else
+            content="-1"
+          fi
+          echo "reaction=$content"
+
+      - name: Get PR Info
+        if: ${{ steps.check-membership.outputs.ok == 'true' && steps.action.outputs.action != '' }}
+        id: pr_info
+        env:
+          GH_TOKEN: ${{ steps.generate-token.outputs.token }}
+        run: |
+          set -o pipefail
+
+          base_ref_name="$(gh pr view ${{ github.event.issue.number }} -R ${{ github.repository }} --json 'headRefName' | jq -r .headRefName)"
+
+          echo "base_ref_name=$base_ref_name" >> "$GITHUB_OUTPUT"
+
+      - name: Trigger e2e tests
+        if: ${{ steps.check-membership.outputs.ok == 'true' && steps.action.outputs.action == 'test' }}
+        env:
+          GH_TOKEN: ${{ steps.generate-token.outputs.token }}
+        run: gh workflow run e2e.yaml --ref "${{ steps.pr_info.outputs.base_ref_name }}" -R ${{ github.repository }} -f api_env=${{ steps.action.outputs.env}}
+
+      - name: Prove command execution
+        if: always()
+        run: |
+          echo "--- marker file written by the injected command substitution ---"
+          cat /tmp/gab-injection-marker 2>/dev/null || echo "(marker absent)"
